@@ -1,0 +1,749 @@
+import os
+
+# ============================================
+# FIX 1: src/predictor.py - Updated predict_breeding method
+# ============================================
+predictor_code = r'''import joblib
+import pandas as pd
+import os
+
+class AgriPredictor:
+    def __init__(self):
+        base_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        
+        try:
+            self.tool_model = joblib.load(os.path.join(base_path, 'models/tool_demand.pkl'))
+            self.tool_meta = joblib.load(os.path.join(base_path, 'models/tool_demand_encoders.pkl'))
+            self.tool_encoders = self.tool_meta.get('encoders', {})
+            self.tool_features = self.tool_meta.get('feature_cols', [])
+            print(f"✅ Tool model loaded with features: {self.tool_features}")
+        except Exception as e:
+            print(f"⚠️ Tool model not loaded: {e}")
+            self.tool_model = None
+        
+        try:
+            self.breed_model = joblib.load(os.path.join(base_path, 'models/breeding_predictor.pkl'))
+            self.breed_meta = joblib.load(os.path.join(base_path, 'models/breeding_predictor_encoders.pkl'))
+            self.breed_encoders = self.breed_meta.get('encoders', {})
+            self.breed_features = self.breed_meta.get('feature_cols', [])
+            print(f"✅ Breeding model loaded with features: {self.breed_features}")
+        except Exception as e:
+            print(f"⚠️ Breeding model not loaded: {e}")
+            self.breed_model = None
+        
+        try:
+            self.seed_model = joblib.load(os.path.join(base_path, 'models/seed_advisor.pkl'))
+            self.seed_meta = joblib.load(os.path.join(base_path, 'models/seed_advisor_encoders.pkl'))
+            self.seed_encoders = self.seed_meta.get('encoders', {})
+            self.seed_features = self.seed_meta.get('feature_cols', [])
+        except Exception as e:
+            print(f"⚠️ Seed model not loaded: {e}")
+            self.seed_model = None
+        
+        self.price_models = {}
+        self.price_models_info = {}
+        try:
+            self.price_models_info = joblib.load(os.path.join(base_path, 'models/price_models_info.pkl'))
+            for crop, info in self.price_models_info.items():
+                self.price_models[crop] = joblib.load(info['model_path'])
+            print(f"✅ Loaded {len(self.price_models)} price prediction models")
+        except Exception as e:
+            print(f"⚠️ Price models not loaded: {e}")
+    
+    def predict_tool(self, tool_name, region, season, rainfall, temp, crop_cycle, land_acres=5.0):
+        tool_name = str(tool_name).lower().strip()
+        region = str(region).lower().strip()
+        season = str(season).lower().strip()
+        crop_cycle = str(crop_cycle).lower().strip()
+        land_acres = float(land_acres) if land_acres else 5.0
+        
+        if self.tool_model is None:
+            return {"error": "Model not loaded"}
+        
+        try:
+            encoded_vals = {}
+            mapping = {
+                'tool_type': tool_name, 'season': season, 'region': region, 'crop_cycle': crop_cycle,
+                'land_acres': land_acres, 'rainfall_mm': float(rainfall), 'temperature_c': float(temp)
+            }
+            for col, val in mapping.items():
+                if col in self.tool_features:
+                    if isinstance(val, str):
+                        le = self.tool_encoders.get(f'le_{col}')
+                        if le:
+                            try:
+                                encoded_vals[col] = le.transform([val])[0]
+                            except ValueError:
+                                encoded_vals[col] = 0
+                        else:
+                            encoded_vals[col] = 0
+                    else:
+                        encoded_vals[col] = val
+            
+            X = pd.DataFrame([encoded_vals], columns=self.tool_features)
+            preds = self.tool_model.predict(X)[0]
+            demand = float(preds[0])
+            maint = int(float(preds[1]))
+            
+            per_acre_hours = round(demand / max(land_acres, 0.1), 2)
+            
+            if land_acres <= 2:
+                size_category = "small farm"
+                size_advice = "Consider renting equipment instead of buying."
+            elif land_acres <= 10:
+                size_category = "medium farm"
+                size_advice = "Equipment ownership is cost-effective."
+            else:
+                size_category = "large farm"
+                size_advice = "Invest in owned machinery for long-term savings."
+            
+            COST_PER_HOUR = {'tractor': 600, 'plough': 500, 'harrows': 450, 'cultivator': 550,
+                           'seed_drill': 650, 'sprayer': 350, 'pump': 200, 'sickle': 150, 'harvester': 1200}
+            FUEL_PER_HOUR = {'tractor': 4.5, 'plough': 4.0, 'harrows': 3.5, 'cultivator': 4.0,
+                           'seed_drill': 4.5, 'sprayer': 1.5, 'pump': 2.5, 'sickle': 0, 'harvester': 8.0}
+            LABOR_PER_ACRE = {'tractor': 1, 'plough': 1, 'harrows': 1, 'cultivator': 1,
+                            'seed_drill': 2, 'sprayer': 2, 'pump': 1, 'sickle': 8, 'harvester': 3}
+            
+            cost_per_hour = COST_PER_HOUR.get(tool_name, 500)
+            fuel_per_hour = FUEL_PER_HOUR.get(tool_name, 3.0)
+            labor_per_acre = LABOR_PER_ACRE.get(tool_name, 1)
+            
+            total_cost = round(demand * cost_per_hour, 2)
+            total_fuel = round(demand * fuel_per_hour, 2)
+            labor_required = max(1, int(labor_per_acre * land_acres))
+            days_to_complete = max(1, round(demand / 8, 1))
+            
+            if crop_cycle == 'harvesting' and tool_name in ['sickle', 'harvester']:
+                if demand > 80:
+                    rec = f"🔥 PEAK HARVEST DEMAND: {land_acres} acres need {demand:.0f} hrs. Service {tool_name} before harvest."
+                else:
+                    rec = f"✅ Moderate harvest demand for {tool_name} on {land_acres} acres."
+            elif crop_cycle in ['sowing', 'land_preparation'] and tool_name in ['tractor', 'plough', 'seed_drill']:
+                if demand > 100:
+                    rec = f"🔥 HIGH SOWING DEMAND: {land_acres} acres require {demand:.0f} hrs. Schedule pre-season maintenance."
+                else:
+                    rec = f"✅ Normal sowing demand for {tool_name} on {land_acres} acres."
+            else:
+                if demand < 60:
+                    rec = f"✅ Low usage ({demand:.0f} hrs) for {tool_name} on {land_acres} acres during {crop_cycle}."
+                else:
+                    rec = f"⚡ {demand:.0f} hrs expected for {tool_name} on {land_acres} acres."
+            
+            if total_cost > 50000:
+                cost_advice = "💰 High operation cost. Consider bulk fuel purchase discounts."
+            elif total_cost > 20000:
+                cost_advice = "💰 Moderate cost. Plan fuel and labor in advance."
+            else:
+                cost_advice = "✅ Affordable operation. Good for small farms."
+            
+            return {
+                "tool": tool_name, "land_acres": land_acres, "farm_category": size_category,
+                "crop_cycle": crop_cycle, "season": season,
+                "predicted_demand_hours": round(demand, 2), "per_acre_hours": per_acre_hours,
+                "optimal_maintenance_days": maint,
+                "cost_per_hour": cost_per_hour, "total_estimated_cost": total_cost,
+                "fuel_required_liters": total_fuel, "labor_required": labor_required,
+                "days_to_complete": days_to_complete,
+                "usage_recommendation": rec, "farm_advice": size_advice, "cost_advice": cost_advice
+            }
+        except Exception as e:
+            return {"error": str(e)}
+    
+    def predict_breeding(self, male_species, male_breed, female_species, female_breed,
+                        m_age, f_age, m_wt, f_wt, f_milk, health, genetics, region='north'):
+        """Enhanced cross-breeding prediction with species compatibility"""
+        male_species = str(male_species).lower().strip()
+        male_breed = str(male_breed).lower().strip()
+        female_species = str(female_species).lower().strip()
+        female_breed = str(female_breed).lower().strip()
+        region = str(region).lower().strip()
+        
+        if self.breed_model is None:
+            return {"error": "Model not loaded"}
+        
+        try:
+            is_cross_species = male_species != female_species
+            is_cross_breed = male_breed != female_breed
+            
+            COMPATIBILITY = {
+                ('cow', 'cow'): 0.95, ('buffalo', 'buffalo'): 0.95,
+                ('goat', 'goat'): 0.95, ('sheep', 'sheep'): 0.95,
+                ('cow', 'buffalo'): 0.0, ('buffalo', 'cow'): 0.0,
+                ('goat', 'sheep'): 0.3, ('sheep', 'goat'): 0.3,
+            }
+            
+            base_compat = COMPATIBILITY.get((male_species, female_species), 0.5)
+            
+            if base_compat == 0.0:
+                return {
+                    "error": f"Cross-breeding {male_species} × {female_species} is biologically impossible",
+                    "compatibility_score": 0,
+                    "recommendation": f"{male_species.title()} and {female_species.title()} cannot be cross-bred. They are different species.",
+                    "male_species": male_species, "male_breed": male_breed,
+                    "female_species": female_species, "female_breed": female_breed,
+                    "suggestion": f"Try breeding within the same species (e.g., {male_species} × {male_species})"
+                }
+            
+            primary_species = male_species
+            primary_breed = male_breed
+            
+            encoded_vals = {}
+            mapping = {
+                'species': primary_species, 'breed': primary_breed, 'region': region,
+                'male_age': float(m_age), 'female_age': float(f_age),
+                'male_weight_kg': float(m_wt), 'female_weight_kg': float(f_wt),
+                'female_milk_yield_lpd': float(f_milk), 'health_score': float(health),
+                'genetic_diversity_idx': float(genetics)
+            }
+            
+            for col, val in mapping.items():
+                if col in self.breed_features:
+                    if isinstance(val, str):
+                        le = self.breed_encoders.get(f'le_{col}')
+                        if le:
+                            try:
+                                encoded_vals[col] = le.transform([val])[0]
+                            except ValueError:
+                                encoded_vals[col] = 0
+                        else:
+                            encoded_vals[col] = 0
+                    else:
+                        encoded_vals[col] = val
+            
+            X = pd.DataFrame([encoded_vals], columns=self.breed_features)
+            preds = self.breed_model.predict(X)[0]
+            
+            base_success = float(preds[3])
+            
+            if is_cross_breed and not is_cross_species:
+                hybrid_vigor = 1.08
+                base_success = min(0.95, base_success * hybrid_vigor)
+                breed_type = "cross-breed"
+            elif not is_cross_breed:
+                breed_type = "pure-breed"
+            else:
+                breed_type = "cross-species (rare)"
+            
+            offspring_weight = float(preds[0])
+            milk_potential = float(preds[1])
+            disease_resistance = float(preds[2])
+            success_prob = base_success * base_compat
+            
+            if success_prob > 0.80:
+                rec = f"🎯 EXCELLENT MATCH ({success_prob*100:.1f}%): Ideal {breed_type} pairing. High genetic diversity."
+            elif success_prob > 0.60:
+                rec = f"✅ GOOD MATCH ({success_prob*100:.1f}%): Compatible {breed_type}. Expected healthy offspring."
+            elif success_prob > 0.40:
+                rec = f"⚠️ MODERATE MATCH ({success_prob*100:.1f}%): Consider consulting a veterinarian."
+            else:
+                rec = f"❌ LOW COMPATIBILITY ({success_prob*100:.1f}%): Not recommended. Try different pairing."
+            
+            compatibility_score = round(success_prob * 100, 1)
+            
+            return {
+                "male_species": male_species, "male_breed": male_breed,
+                "female_species": female_species, "female_breed": female_breed,
+                "region": region, "breeding_type": breed_type,
+                "is_cross_species": is_cross_species, "is_cross_breed": is_cross_breed,
+                "compatibility_score": compatibility_score,
+                "offspring_weight_kg": round(offspring_weight, 2),
+                "offspring_milk_potential_lpd": round(milk_potential, 2),
+                "disease_resistance_score": round(disease_resistance, 2),
+                "breeding_success_prob": round(success_prob * 100, 1),
+                "recommendation": rec,
+                "genetic_benefit": "Hybrid vigor expected - offspring may outperform parents" if is_cross_breed and not is_cross_species else "Standard inheritance pattern"
+            }
+        except Exception as e:
+            return {"error": str(e)}
+    
+    def predict_seed(self, crop, ph, rainfall, temp, humidity, season, organic_c, region='north'):
+        crop = str(crop).lower().strip()
+        season = str(season).lower().strip()
+        region = str(region).lower().strip()
+        
+        if self.seed_model is None:
+            return {"error": "Model not loaded"}
+        
+        try:
+            encoded_vals = {}
+            mapping = {
+                'crop_type': crop, 'season': season, 'region': region,
+                'soil_ph': float(ph), 'rainfall_mm': float(rainfall),
+                'temperature_c': float(temp), 'humidity_pct': float(humidity),
+                'soil_organic_c': float(organic_c)
+            }
+            for col, val in mapping.items():
+                if col in self.seed_features:
+                    if isinstance(val, str):
+                        le = self.seed_encoders.get(f'le_{col}')
+                        if le:
+                            try:
+                                encoded_vals[col] = le.transform([val])[0]
+                            except ValueError:
+                                encoded_vals[col] = 0
+                        else:
+                            encoded_vals[col] = 0
+                    else:
+                        encoded_vals[col] = val
+            
+            X = pd.DataFrame([encoded_vals], columns=self.seed_features)
+            preds = self.seed_model.predict(X)[0]
+            suit = float(preds[1]) * 100
+            
+            return {
+                "crop": crop, "season": season, "region": region,
+                "expected_yield_t_ha": round(float(preds[0]), 2),
+                "seasonal_suitability_score": round(suit, 1),
+                "planting_window": "Optimal window for sowing." if suit > 75 else "Wait for better conditions.",
+                "soil_treatment": "Maintain pH 6.0-7.0 and add organic matter."
+            }
+        except Exception as e:
+            return {"error": str(e)}
+    
+    def predict_price(self, crop, months_ahead=3):
+        crop = str(crop).lower().strip()
+        if crop not in self.price_models:
+            return {"error": f"Price model not available for {crop}."}
+        try:
+            model = self.price_models[crop]
+            info = self.price_models_info[crop]
+            days_ahead = months_ahead * 30
+            future = model.make_future_dataframe(periods=days_ahead)
+            forecast = model.predict(future)
+            future_forecast = forecast.tail(days_ahead)
+            
+            current_price = info['latest_price']
+            avg_predicted = future_forecast['yhat'].mean()
+            min_predicted = future_forecast['yhat_lower'].min()
+            max_predicted = future_forecast['yhat_upper'].max()
+            final_price = future_forecast['yhat'].iloc[-1]
+            
+            price_change_pct = ((final_price - current_price) / current_price) * 100
+            
+            price_df = pd.read_csv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data/crop_prices.csv'))
+            crop_meta = price_df[price_df['crop'] == crop].iloc[-1]
+            
+            cost_per_acre = crop_meta['cost_per_acre']
+            yield_per_acre = crop_meta['yield_per_acre']
+            msp = crop_meta['msp']
+            
+            expected_revenue = final_price * yield_per_acre
+            expected_profit = expected_revenue - cost_per_acre
+            roi_pct = (expected_profit / cost_per_acre) * 100
+            
+            if price_change_pct > 10:
+                trend = "📈 STRONG BULLISH"
+                advice = f"Excellent time to plant {crop}. Prices expected to rise {price_change_pct:.1f}%."
+            elif price_change_pct > 0:
+                trend = "📊 SLIGHTLY BULLISH"
+                advice = f"Moderate price increase expected. {crop} is a safe choice."
+            elif price_change_pct > -10:
+                trend = "📉 SLIGHTLY BEARISH"
+                advice = f"Small price dip expected. Consider alternative crops."
+            else:
+                trend = "⚠️ STRONG BEARISH"
+                advice = f"Prices may drop {abs(price_change_pct):.1f}%. Avoid planting {crop}."
+            
+            return {
+                "crop": crop, "months_ahead": months_ahead,
+                "current_price": round(current_price, 2),
+                "predicted_avg_price": round(avg_predicted, 2),
+                "predicted_final_price": round(final_price, 2),
+                "price_range": {"min": round(min_predicted, 2), "max": round(max_predicted, 2)},
+                "price_change_pct": round(price_change_pct, 2),
+                "trend": trend, "msp": msp,
+                "profit_analysis": {
+                    "cost_per_acre": cost_per_acre,
+                    "yield_per_acre_quintals": yield_per_acre,
+                    "expected_revenue": round(expected_revenue, 2),
+                    "expected_profit": round(expected_profit, 2),
+                    "roi_percent": round(roi_pct, 2)
+                },
+                "recommendation": advice, "model_accuracy": info['accuracy']
+            }
+        except Exception as e:
+            return {"error": str(e)}
+    
+    def get_best_crop_recommendation(self, months_ahead=3):
+        if not self.price_models:
+            return {"error": "Price models not loaded"}
+        try:
+            results = []
+            for crop in self.price_models.keys():
+                prediction = self.predict_price(crop, months_ahead)
+                if 'error' not in prediction:
+                    results.append({
+                        'crop': crop,
+                        'predicted_price': prediction['predicted_final_price'],
+                        'profit': prediction['profit_analysis']['expected_profit'],
+                        'roi': prediction['profit_analysis']['roi_percent'],
+                        'trend': prediction['trend'],
+                        'price_change': prediction['price_change_pct']
+                    })
+            results.sort(key=lambda x: x['roi'], reverse=True)
+            return {
+                "best_crop": results[0]['crop'],
+                "best_roi": results[0]['roi'],
+                "best_profit_per_acre": results[0]['profit'],
+                "all_crops_ranked": results,
+                "recommendation": f"Based on {months_ahead}-month price forecast, plant {results[0]['crop']} for maximum profit (₹{results[0]['profit']:,.0f}/acre, {results[0]['roi']:.1f}% ROI)."
+            }
+        except Exception as e:
+            return {"error": str(e)}
+'''
+
+with open('src/predictor.py', 'w', encoding='utf-8') as f:
+    f.write(predictor_code)
+print("✅ Fixed src/predictor.py with new predict_breeding signature")
+
+# ============================================
+# FIX 2: app.py - Professional Section 2 Display
+# ============================================
+# Read current app.py
+with open('app.py', 'r', encoding='utf-8') as f:
+    app_content = f.read()
+
+# Find Section 2 start and end markers
+section2_start = "# ============================================\n# SECTION 2: 🐄 CROSS-BREEDING PREDICTOR"
+section3_start = "# ============================================\n# SECTION 3: 🌱 SEED & PLANT ADVISOR"
+
+if section2_start in app_content and section3_start in app_content:
+    # New professional Section 2
+    new_section2 = '''# ============================================
+# SECTION 2: 🐄 CROSS-BREEDING PREDICTOR (PROFESSIONAL)
+# ============================================
+with tabs[1]:
+    st.header("🐄 Livestock Cross-Breeding Prediction")
+    st.markdown("*Professional genetic analysis for optimal breeding decisions*")
+    
+    # Custom CSS for professional look
+    st.markdown("""
+    <style>
+    .breeding-card {
+        background: white;
+        padding: 1.5rem;
+        border-radius: 15px;
+        box-shadow: 0 4px 20px rgba(0,0,0,0.08);
+        margin: 1rem 0;
+        border-left: 5px solid #667eea;
+    }
+    .metric-big {
+        font-size: 2.5rem;
+        font-weight: bold;
+        color: #2c3e50;
+        text-align: center;
+        padding: 1rem;
+    }
+    .compatibility-meter {
+        height: 30px;
+        border-radius: 15px;
+        background: linear-gradient(to right, #e74c3c 0%, #f39c12 50%, #2ecc71 100%);
+        position: relative;
+        margin: 1rem 0;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    col1, col2 = st.columns([1, 2])
+    
+    with col1:
+        # Male Section
+        st.markdown("### ♂️ Male Animal")
+        st.markdown('<div class="breeding-card">', unsafe_allow_html=True)
+        
+        BREED_OPTIONS = {
+            'cow': ['sahiwal', 'gir', 'red_sindhi', 'tharparkar', 'holstein', 'jersey'],
+            'buffalo': ['murrah', 'niliravi', 'jaffarabadi', 'mehsana', 'surti'],
+            'goat': ['jamunapari', 'beetal', 'sirohi', 'black_bengal', 'osmanabadi'],
+            'sheep': ['deccani', 'mandya', 'mecheri', 'bellary', 'dorper']
+        }
+        
+        male_species = st.selectbox("Species", ["cow", "buffalo", "goat", "sheep"], key="male_species")
+        male_breed = st.selectbox("Breed", BREED_OPTIONS[male_species], key="male_breed")
+        male_img = st.file_uploader("📸 Photo (optional)", type=["jpg", "png", "jpeg"], key="male_img")
+        m_age = st.number_input("Age (years)", 1.0, 12.0, 3.5, key="m_age")
+        m_wt = st.number_input("Weight (kg)", 100, 1000, 400, key="m_wt")
+        
+        st.markdown('</div>', unsafe_allow_html=True)
+        
+        st.divider()
+        
+        # Female Section
+        st.markdown("### ♀️ Female Animal")
+        st.markdown('<div class="breeding-card">', unsafe_allow_html=True)
+        
+        female_species = st.selectbox("Species", ["cow", "buffalo", "goat", "sheep"], key="female_species")
+        female_breed = st.selectbox("Breed", BREED_OPTIONS[female_species], key="female_breed")
+        female_img = st.file_uploader("📸 Photo (optional)", type=["jpg", "png", "jpeg"], key="female_img")
+        f_age = st.number_input("Age (years)", 1.0, 10.0, 3.0, key="f_age")
+        f_wt = st.number_input("Weight (kg)", 100, 800, 350, key="f_wt")
+        f_milk = st.number_input("Milk Yield (L/day)", 0, 40, 18, key="f_milk")
+        
+        st.markdown('</div>', unsafe_allow_html=True)
+        
+        st.divider()
+        
+        # Common Parameters
+        st.markdown("### 🧬 Genetic Parameters")
+        health = st.slider("Health Score", 50, 100, 85, key="health")
+        genetics = st.slider("Genetic Diversity", 0.2, 0.95, 0.7, step=0.05, key="genetics")
+        region_b = st.selectbox("Region", ["north", "south", "east", "west", "central"], key="region_b")
+        
+        if st.button("🔍 Analyze Breeding Compatibility", type="primary", use_container_width=True):
+            with st.spinner("🧬 Analyzing genetic compatibility..."):
+                files = {}
+                if male_img:
+                    files['male_image'] = (male_img.name, male_img.getvalue(), male_img.type)
+                if female_img:
+                    files['female_image'] = (female_img.name, female_img.getvalue(), female_img.type)
+                
+                data = {
+                    "male_species": male_species, "male_breed": male_breed,
+                    "male_age": m_age, "male_weight": m_wt,
+                    "female_species": female_species, "female_breed": female_breed,
+                    "female_age": f_age, "female_weight": f_wt, "female_milk": f_milk,
+                    "health_score": health, "genetic_diversity": genetics, "region": region_b
+                }
+                
+                try:
+                    import requests as req
+                    res = req.post(f"{API_URL}/predict/breeding", data=data, files=files, timeout=60)
+                    if res.status_code == 200:
+                        result = res.json()
+                        st.session_state['breeding_result'] = result
+                    else:
+                        st.error(f"❌ Error {res.status_code}: {res.text}")
+                except Exception as e:
+                    st.error(f"❌ Request failed: {e}")
+    
+    with col2:
+        st.subheader("📊 Breeding Analysis Report")
+        
+        if 'breeding_result' in st.session_state:
+            result = st.session_state['breeding_result']
+            
+            if 'error' in result:
+                st.error(f"❌ {result['error']}")
+                if 'suggestion' in result:
+                    st.info(f"💡 **Suggestion:** {result['suggestion']}")
+            else:
+                compat = result['compatibility_score']
+                
+                # 🎯 Professional Compatibility Banner
+                if compat >= 80:
+                    banner_gradient = "linear-gradient(135deg, #11998e 0%, #38ef7d 100%)"
+                    status_text = "EXCELLENT COMPATIBILITY"
+                    status_emoji = "🎯"
+                elif compat >= 60:
+                    banner_gradient = "linear-gradient(135deg, #2193b0 0%, #6dd5ed 100%)"
+                    status_text = "GOOD COMPATIBILITY"
+                    status_emoji = "✅"
+                elif compat >= 40:
+                    banner_gradient = "linear-gradient(135deg, #f7971e 0%, #ffd200 100%)"
+                    status_text = "MODERATE COMPATIBILITY"
+                    status_emoji = "⚠️"
+                else:
+                    banner_gradient = "linear-gradient(135deg, #cb2d3e 0%, #ef473a 100%)"
+                    status_text = "LOW COMPATIBILITY"
+                    status_emoji = "❌"
+                
+                st.markdown(f"""
+                <div style='background: {banner_gradient}; padding: 2rem; border-radius: 15px; 
+                            color: white; text-align: center; box-shadow: 0 8px 25px rgba(0,0,0,0.15);'>
+                    <div style='font-size: 3rem; margin-bottom: 0.5rem;'>{status_emoji}</div>
+                    <h2 style='margin: 0; color: white; font-size: 1.8rem;'>{status_text}</h2>
+                    <div style='font-size: 4rem; font-weight: bold; margin: 1rem 0; color: white;'>
+                        {compat:.1f}%
+                    </div>
+                    <p style='margin: 0; color: white; font-size: 1.1rem;'>
+                        <strong>{result['male_species'].title()}</strong> ({result['male_breed'].title()}) ♂️
+                        &nbsp;×&nbsp;
+                        <strong>{result['female_species'].title()}</strong> ({result['female_breed'].title()}) ♀️
+                    </p>
+                    <div style='margin-top: 1rem; padding: 0.5rem; background: rgba(255,255,255,0.2); 
+                                border-radius: 8px; display: inline-block;'>
+                        <span style='color: white;'>Breeding Type: <strong>{result['breeding_type'].replace('-', ' ').title()}</strong></span>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                st.divider()
+                
+                # 📊 Offspring Predictions - Professional Cards
+                st.markdown("### 🐣 Predicted Offspring Traits")
+                
+                col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+                
+                with col_m1:
+                    st.markdown(f"""
+                    <div style='background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+                                padding: 1.5rem; border-radius: 12px; color: white; text-align: center;'>
+                        <div style='font-size: 2rem;'>🏋️</div>
+                        <div style='font-size: 0.9rem; opacity: 0.9;'>Birth Weight</div>
+                        <div style='font-size: 1.8rem; font-weight: bold; margin: 0.5rem 0;'>
+                            {result['offspring_weight_kg']:.1f}
+                        </div>
+                        <div style='font-size: 0.8rem; opacity: 0.8;'>kilograms</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                with col_m2:
+                    st.markdown(f"""
+                    <div style='background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); 
+                                padding: 1.5rem; border-radius: 12px; color: white; text-align: center;'>
+                        <div style='font-size: 2rem;'>🥛</div>
+                        <div style='font-size: 0.9rem; opacity: 0.9;'>Milk Potential</div>
+                        <div style='font-size: 1.8rem; font-weight: bold; margin: 0.5rem 0;'>
+                            {result['offspring_milk_potential_lpd']:.1f}
+                        </div>
+                        <div style='font-size: 0.8rem; opacity: 0.8;'>liters/day</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                with col_m3:
+                    st.markdown(f"""
+                    <div style='background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%); 
+                                padding: 1.5rem; border-radius: 12px; color: white; text-align: center;'>
+                        <div style='font-size: 2rem;'>🛡️</div>
+                        <div style='font-size: 0.9rem; opacity: 0.9;'>Disease Resistance</div>
+                        <div style='font-size: 1.8rem; font-weight: bold; margin: 0.5rem 0;'>
+                            {result['disease_resistance_score']:.1f}
+                        </div>
+                        <div style='font-size: 0.8rem; opacity: 0.8;'>out of 100</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                with col_m4:
+                    st.markdown(f"""
+                    <div style='background: linear-gradient(135deg, #fa709a 0%, #fee140 100%); 
+                                padding: 1.5rem; border-radius: 12px; color: white; text-align: center;'>
+                        <div style='font-size: 2rem;'>🎯</div>
+                        <div style='font-size: 0.9rem; opacity: 0.9;'>Success Rate</div>
+                        <div style='font-size: 1.8rem; font-weight: bold; margin: 0.5rem 0;'>
+                            {result['breeding_success_prob']:.1f}%
+                        </div>
+                        <div style='font-size: 0.8rem; opacity: 0.8;'>probability</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                st.divider()
+                
+                # 💡 AI Recommendation - Professional Box
+                st.markdown("### 💡 Expert Recommendation")
+                st.markdown(f"""
+                <div style='background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%); 
+                            padding: 2rem; border-radius: 15px; color: white; 
+                            box-shadow: 0 4px 15px rgba(17,153,142,0.3);'>
+                    <h3 style='margin: 0 0 1rem 0; color: white;'>🎯 AI Expert Analysis</h3>
+                    <p style='margin: 0; color: white; font-size: 1.1rem; line-height: 1.6;'>
+                        {result['recommendation']}
+                    </p>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                st.divider()
+                
+                # 🧬 Genetic Analysis Details
+                st.markdown("### 🧬 Genetic Analysis Details")
+                
+                col_g1, col_g2 = st.columns(2)
+                
+                with col_g1:
+                    st.markdown("#### 🌟 Breeding Advantage")
+                    if result.get('is_cross_breed') and not result.get('is_cross_species'):
+                        st.success(f"""
+                        **✅ Cross-Breed Hybrid Vigor**
+                        
+                        {result.get('genetic_benefit', 'Hybrid vigor expected')}
+                        
+                        Cross-breeding different breeds of the same species often produces 
+                        offspring with superior traits including:
+                        - 📈 Better growth rates
+                        - 🛡️ Enhanced disease resistance
+                        - 🥛 Higher milk yield potential
+                        """)
+                    else:
+                        st.info(f"""
+                        **📋 Pure-Breed Lineage**
+                        
+                        {result.get('genetic_benefit', 'Standard inheritance')}
+                        
+                        Maintains breed characteristics and predictable traits.
+                        """)
+                
+                with col_g2:
+                    st.markdown("#### 📍 Regional Information")
+                    st.info(f"""
+                    **🌍 Region:** {result['region'].title()}
+                    
+                    **♂️ Male:** {result['male_species'].title()} ({result['male_breed'].title()})
+                    
+                    **♀️ Female:** {result['female_species'].title()} ({result['female_breed'].title()})
+                    
+                    **🧬 Breeding Type:** {result['breeding_type'].replace('-', ' ').title()}
+                    """)
+                
+                st.divider()
+                
+                # 📥 Export Options
+                st.markdown("### 📥 Export Report")
+                
+                col_e1, col_e2 = st.columns(2)
+                with col_e1:
+                    import json
+                    json_data = json.dumps(result, indent=2)
+                    st.download_button(
+                        "📄 Download JSON Report",
+                        data=json_data,
+                        file_name=f"breeding_{result['male_species']}_{result['female_species']}_report.json",
+                        mime="application/json",
+                        use_container_width=True
+                    )
+                with col_e2:
+                    import pandas as pd
+                    csv_data = pd.DataFrame([result]).to_csv(index=False)
+                    st.download_button(
+                        "📊 Download CSV Report",
+                        data=csv_data,
+                        file_name=f"breeding_{result['male_species']}_{result['female_species']}_report.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+        else:
+            st.info("👈 Enter male & female details and click **Analyze Breeding Compatibility**")
+            
+            st.markdown("""
+            ### 🐄 Understanding Cross-Breeding
+            
+            | Pairing Type | Success Rate | Benefit |
+            |--------------|--------------|---------|
+            | **Same Species, Same Breed** | 85-95% | Pure lineage preservation |
+            | **Same Species, Different Breed** | 90-98% | 🌟 Hybrid vigor, better traits |
+            | **Different Species** | ❌ Not Possible | Biologically incompatible |
+            
+            **💡 Pro Tip:** Cross-breeding different breeds of the same species (e.g., Sahiwal × Gir cows) 
+            produces offspring with **hybrid vigor** - better growth, disease resistance, and milk yield!
+            """)
+'''
+    
+    # Replace Section 2
+    start_idx = app_content.find(section2_start)
+    end_idx = app_content.find(section3_start)
+    
+    new_app_content = (
+        app_content[:start_idx] + 
+        new_section2 + "\n\n" + 
+        app_content[end_idx:]
+    )
+    
+    with open('app.py', 'w', encoding='utf-8') as f:
+        f.write(new_app_content)
+    print("✅ Updated Section 2 in app.py with professional display")
+else:
+    print("⚠️ Could not find section markers. Please manually replace Section 2.")
+
+print("\n🎉 Fix complete!")
+print("\n📝 Next steps:")
+print("1. Restart backend (Ctrl+C in Terminal 1, then run uvicorn command)")
+print("2. Refresh browser at http://localhost:8501")
+print("3. Test Section 2 with different species combinations")
